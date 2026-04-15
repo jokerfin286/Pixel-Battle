@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>Pixel Battle · Чистая версия</title>
+    <title>Pixel Battle · Мультиплеер</title>
     <style>
         * {
             margin: 0;
@@ -62,6 +62,19 @@
             font-variant-numeric: tabular-nums;
             letter-spacing: -0.2px;
             border: 1px solid rgba(255,255,255,0.08);
+        }
+
+        .connection-status {
+            background: #222224;
+            border-radius: 8px;
+            padding: 6px 12px;
+            font-size: 11px;
+            color: #4CAF50;
+            border: 1px solid rgba(255,255,255,0.08);
+        }
+
+        .connection-status.disconnected {
+            color: #f44336;
         }
 
         .minimap {
@@ -210,6 +223,20 @@
             font-variant-numeric: tabular-nums;
         }
 
+        .online-counter {
+            position: absolute;
+            bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+            left: 50%;
+            transform: translateX(-50%);
+            background: #222224;
+            border-radius: 20px;
+            padding: 8px 16px;
+            font-size: 12px;
+            color: rgba(255,255,255,0.6);
+            pointer-events: auto;
+            border: 1px solid rgba(255,255,255,0.08);
+        }
+
         @media (max-width: 600px) {
             .color-panel {
                 width: calc(100% - 32px);
@@ -229,6 +256,7 @@
         <div class="top-bar">
             <div class="pill" id="coordsDisplay">503, 315</div>
             <div class="pill" id="zoomDisplay">81%</div>
+            <div class="connection-status" id="connectionStatus">● Подключение...</div>
         </div>
         
         <div class="minimap" id="minimapContainer">
@@ -252,6 +280,8 @@
                 <div class="timer-text" id="timerText">Готов к установке</div>
             </div>
         </div>
+
+        <div class="online-counter" id="onlineCounter">👤 1 онлайн</div>
     </div>
 
     <script>
@@ -264,6 +294,12 @@
             const MAX_ZOOM = 80;
             const ZOOM_SPEED = 0.025;
             
+            // ЗАМЕНИТЕ НА ВАШ URL ПОСЛЕ ДЕПЛОЯ НА RENDER
+            const WS_URL = 'wss://pixel-battle-server.onrender.com';
+            let ws = null;
+            let connected = false;
+            let reconnectTimer = null;
+            
             const viewport = document.getElementById('viewport');
             const ctx = viewport.getContext('2d', { alpha: false });
             const minimapCanvas = document.getElementById('minimap');
@@ -275,6 +311,8 @@
             const timerFill = document.getElementById('timerFill');
             const placeButton = document.getElementById('placeButton');
             const colorGrid = document.getElementById('colorGrid');
+            const connectionStatus = document.getElementById('connectionStatus');
+            const onlineCounter = document.getElementById('onlineCounter');
             
             const offscreenCanvas = document.createElement('canvas');
             offscreenCanvas.width = CANVAS_SIZE;
@@ -297,7 +335,7 @@
             let mouseX = window.innerWidth / 2;
             let mouseY = window.innerHeight / 2;
             
-            let selectedX = 503, selectedY = 315;
+            let selectedX = 512, selectedY = 512;
             let currentColor = '#FFFFFF';
             
             let lastPlaceTime = 0;
@@ -313,6 +351,91 @@
                 '#00D3DD', '#51E9F4', '#493AC1', '#6A5CFF', '#B44AC0',
                 '#811E9F', '#2B2D42'
             ];
+            
+            function connectWebSocket() {
+                if (ws && ws.readyState === WebSocket.OPEN) return;
+                
+                connectionStatus.textContent = '● Подключение...';
+                connectionStatus.classList.remove('disconnected');
+                
+                ws = new WebSocket(WS_URL);
+                
+                ws.onopen = () => {
+                    console.log('WebSocket connected');
+                    connected = true;
+                    connectionStatus.textContent = '● Подключено';
+                    connectionStatus.classList.remove('disconnected');
+                    
+                    if (reconnectTimer) {
+                        clearTimeout(reconnectTimer);
+                        reconnectTimer = null;
+                    }
+                };
+                
+                ws.onmessage = (event) => {
+                    const message = JSON.parse(event.data);
+                    handleServerMessage(message);
+                };
+                
+                ws.onclose = () => {
+                    console.log('WebSocket disconnected');
+                    connected = false;
+                    connectionStatus.textContent = '● Отключено';
+                    connectionStatus.classList.add('disconnected');
+                    
+                    reconnectTimer = setTimeout(() => connectWebSocket(), 3000);
+                };
+                
+                ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    connectionStatus.textContent = '● Ошибка';
+                    connectionStatus.classList.add('disconnected');
+                };
+            }
+            
+            function handleServerMessage(message) {
+                switch (message.type) {
+                    case 'init':
+                        if (message.canvas) {
+                            const pixels = new Uint32Array(message.canvas);
+                            for (let i = 0; i < pixels.length && i < data.length; i++) {
+                                data[i] = pixels[i];
+                            }
+                            offscreenCtx.putImageData(imageData, 0, 0);
+                            updateMinimap();
+                            render();
+                        }
+                        if (message.onlineCount !== undefined) {
+                            onlineCounter.textContent = `👤 ${message.onlineCount} онлайн`;
+                        }
+                        break;
+                        
+                    case 'pixelUpdate':
+                        const index = message.y * CANVAS_SIZE + message.x;
+                        const colorValue = hexToUint32(message.color);
+                        data[index] = colorValue;
+                        offscreenCtx.putImageData(imageData, 0, 0);
+                        updateMinimap();
+                        render();
+                        break;
+                        
+                    case 'onlineCount':
+                        onlineCounter.textContent = `👤 ${message.count} онлайн`;
+                        break;
+                }
+            }
+            
+            function sendPixelUpdate(x, y, color) {
+                if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return;
+                
+                const message = {
+                    type: 'placePixel',
+                    x: x,
+                    y: y,
+                    color: color
+                };
+                ws.send(JSON.stringify(message));
+            }
             
             function initColorGrid() {
                 colorGrid.innerHTML = '';
@@ -339,6 +462,13 @@
                 const g = parseInt(hex.slice(3, 5), 16);
                 const b = parseInt(hex.slice(5, 7), 16);
                 return 0xFF000000 | (b << 16) | (g << 8) | r;
+            }
+            
+            function canPlacePixel(x, y, colorHex) {
+                const index = y * CANVAS_SIZE + x;
+                const currentPixelColor = data[index];
+                const newColorValue = hexToUint32(colorHex);
+                return currentPixelColor !== newColorValue;
             }
             
             function physicsAnimation() {
@@ -431,109 +561,39 @@
                 };
             }
             
-            let db = null;
-            
-            function initDB() {
-                return new Promise((resolve) => {
-                    const request = indexedDB.open('PixelCanvasDB', 1);
-                    
-                    request.onerror = () => {
-                        console.error('[v0] Failed to open IndexedDB');
-                        resolve(false);
-                    };
-                    
-                    request.onsuccess = () => {
-                        db = request.result;
-                        console.log('[v0] IndexedDB opened');
-                        resolve(true);
-                    };
-                    
-                    request.onupgradeneeded = (event) => {
-                        const database = event.target.result;
-                        if (!database.objectStoreNames.contains('canvas')) {
-                            database.createObjectStore('canvas');
-                        }
-                    };
-                });
-            }
-            
-            function saveCanvas() {
-                if (!db) return;
-                
-                try {
-                    const transaction = db.transaction(['canvas'], 'readwrite');
-                    const store = transaction.objectStore('canvas');
-                    const blob = new Blob([imageData.data], { type: 'application/octet-stream' });
-                    store.put(blob, 'pixelData');
-                    console.log('[v0] Canvas saved to IndexedDB');
-                } catch (e) {
-                    console.error('[v0] Failed to save canvas:', e);
-                }
-            }
-            
-            function loadCanvas() {
-                return new Promise((resolve) => {
-                    if (!db) {
-                        resolve();
-                        return;
-                    }
-                    
-                    try {
-                        const transaction = db.transaction(['canvas'], 'readonly');
-                        const store = transaction.objectStore('canvas');
-                        const request = store.get('pixelData');
-                        
-                        request.onsuccess = () => {
-                            const blob = request.result;
-                            if (blob) {
-                                const reader = new FileReader();
-                                reader.onload = () => {
-                                    const arrayBuffer = reader.result;
-                                    const uint8Array = new Uint8Array(arrayBuffer);
-                                    for (let i = 0; i < uint8Array.length && i < imageData.data.length; i++) {
-                                        imageData.data[i] = uint8Array[i];
-                                    }
-                                    offscreenCtx.putImageData(imageData, 0, 0);
-                                    console.log('[v0] Canvas loaded from IndexedDB');
-                                    updateMinimap();
-                                    render();
-                                    resolve();
-                                };
-                                reader.readAsArrayBuffer(blob);
-                            } else {
-                                updateMinimap();
-                                render();
-                                resolve();
-                            }
-                        };
-                        
-                        request.onerror = () => {
-                            console.error('[v0] Failed to load canvas');
-                            updateMinimap();
-                            render();
-                            resolve();
-                        };
-                    } catch (e) {
-                        console.error('[v0] Error loading canvas:', e);
-                        updateMinimap();
-                        render();
-                        resolve();
-                    }
-                });
-            }
-            
             function placePixel() {
-                if (!nextPlaceAllowed) return;
-                if (selectedX < 0 || selectedY < 0) return;
+                if (!connected) {
+                    timerText.textContent = 'Нет подключения к серверу';
+                    setTimeout(() => updateTimerDisplay(), 1000);
+                    return;
+                }
+                
+                if (!nextPlaceAllowed) {
+                    timerText.textContent = 'Подождите окончания таймера';
+                    setTimeout(() => updateTimerDisplay(), 1000);
+                    return;
+                }
+                
+                if (selectedX < 0 || selectedY < 0) {
+                    timerText.textContent = 'Выберите пиксель';
+                    setTimeout(() => updateTimerDisplay(), 1000);
+                    return;
+                }
+                
+                if (!canPlacePixel(selectedX, selectedY, currentColor)) {
+                    timerText.textContent = 'Этот пиксель уже такого цвета';
+                    setTimeout(() => updateTimerDisplay(), 1000);
+                    return;
+                }
                 
                 const colorValue = hexToUint32(currentColor);
                 
                 data[selectedY * CANVAS_SIZE + selectedX] = colorValue;
                 offscreenCtx.putImageData(imageData, 0, 0);
                 
-                saveCanvas();
-                updateMinimap();
+                sendPixelUpdate(selectedX, selectedY, currentColor);
                 
+                updateMinimap();
                 startCooldown();
                 render();
             }
@@ -614,7 +674,6 @@
                     selectedX = pos.x;
                     selectedY = pos.y;
                     render();
-                    placePixel();
                 }
             }
             
@@ -638,15 +697,12 @@
                 zoomMomentum = Math.max(-0.12, Math.min(0.12, zoomMomentum));
             }
             
-            async function init() {
-                await initDB();
+            function init() {
                 initColorGrid();
                 setCurrentColor('#FFFFFF');
                 
                 panX = (window.innerWidth - CANVAS_SIZE * zoom) / 2;
                 panY = (window.innerHeight - CANVAS_SIZE * zoom) / 2;
-                
-                await loadCanvas();
                 
                 viewport.addEventListener('mousedown', onMouseDown);
                 window.addEventListener('mousemove', onMouseMove);
@@ -678,6 +734,8 @@
                     velocityX = velocityY = 0;
                     render();
                 });
+                
+                connectWebSocket();
                 
                 render();
                 updateTimerDisplay();
