@@ -394,36 +394,61 @@
             }
             
             function handleServerMessage(message) {
-                switch (message.type) {
-                    case 'init':
-                        if (message.canvas) {
-                            const pixels = new Uint32Array(message.canvas);
-                            for (let i = 0; i < pixels.length && i < data.length; i++) {
-                                data[i] = pixels[i];
-                            }
-                            offscreenCtx.putImageData(imageData, 0, 0);
-                            updateMinimap();
-                            render();
-                        }
-                        if (message.onlineCount !== undefined) {
-                            onlineCounter.textContent = `👤 ${message.onlineCount} онлайн`;
-                        }
-                        break;
+    switch (message.type) {
+        case 'init':
+            if (message.canvas) {
+                console.time('Canvas load');
+                
+                let pixels;
+                if (message.compressed) {
+                    // Распаковываем RLE
+                    const compressed = message.canvas;
+                    pixels = new Uint32Array(CANVAS_SIZE * CANVAS_SIZE);
+                    let index = 0;
+                    
+                    for (let i = 0; i < compressed.length; i += 2) {
+                        const color = compressed[i];
+                        const count = compressed[i + 1];
                         
-                    case 'pixelUpdate':
-                        const index = message.y * CANVAS_SIZE + message.x;
-                        const colorValue = hexToUint32(message.color);
-                        data[index] = colorValue;
-                        offscreenCtx.putImageData(imageData, 0, 0);
-                        updateMinimap();
-                        render();
-                        break;
-                        
-                    case 'onlineCount':
-                        onlineCounter.textContent = `👤 ${message.count} онлайн`;
-                        break;
+                        // Быстрое заполнение
+                        for (let j = 0; j < count; j++) {
+                            pixels[index++] = color;
+                        }
+                    }
+                } else {
+                    pixels = new Uint32Array(message.canvas);
                 }
+                
+                // Быстрое копирование в imageData
+                for (let i = 0; i < pixels.length; i++) {
+                    data[i] = pixels[i];
+                }
+                
+                offscreenCtx.putImageData(imageData, 0, 0);
+                updateMinimap();
+                render();
+                
+                console.timeEnd('Canvas load');
             }
+            if (message.onlineCount !== undefined) {
+                onlineCounter.textContent = `👤 ${message.onlineCount} онлайн`;
+            }
+            break;
+            
+        case 'pixelUpdate':
+            const index = message.y * CANVAS_SIZE + message.x;
+            const colorValue = hexToUint32(message.color);
+            data[index] = colorValue;
+            offscreenCtx.putImageData(imageData, 0, 0);
+            updateMinimap();
+            render();
+            break;
+            
+        case 'onlineCount':
+            onlineCounter.textContent = `👤 ${message.count} онлайн`;
+            break;
+    }
+}
             
             function sendPixelUpdate(x, y, color) {
                 if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return;
