@@ -2,7 +2,6 @@ const WebSocket = require('ws');
 
 const CANVAS_SIZE = 1024;
 const PORT = process.env.PORT || 8080;
-
 // Хранилище данных в памяти (Render бесплатный не сохраняет файлы надёжно)
 let canvasData = new Uint32Array(CANVAS_SIZE * CANVAS_SIZE);
 canvasData.fill(0xFFFFFFFF); // Белый фон
