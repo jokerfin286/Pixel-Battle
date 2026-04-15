@@ -14,47 +14,93 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 let canvasData = new Uint32Array(CANVAS_SIZE * CANVAS_SIZE);
 canvasData.fill(0xFFFFFFFF);
 
+// Кэш для быстрой отправки новым клиентам
+let cachedCanvasArray = null;
+let lastUpdateTime = Date.now();
+let pixelsCount = 0;
+
+// Сжатие данных через RLE (Run-Length Encoding)
+function compressCanvas(data) {
+    const compressed = [];
+    let count = 1;
+    let current = data[0];
+    
+    for (let i = 1; i < data.length; i++) {
+        if (data[i] === current && count < 65535) {
+            count++;
+        } else {
+            compressed.push([current, count]);
+            current = data[i];
+            count = 1;
+        }
+    }
+    compressed.push([current, count]);
+    
+    // Преобразуем в плоский массив для JSON
+    return compressed.flat();
+}
+
+// Распаковка RLE
+function decompressCanvas(compressed) {
+    const data = new Uint32Array(CANVAS_SIZE * CANVAS_SIZE);
+    let index = 0;
+    
+    for (let i = 0; i < compressed.length; i += 2) {
+        const color = compressed[i];
+        const count = compressed[i + 1];
+        
+        for (let j = 0; j < count; j++) {
+            data[index++] = color;
+        }
+    }
+    
+    return data;
+}
+
+// Обновление кэша
+function updateCache() {
+    cachedCanvasArray = compressCanvas(canvasData);
+    lastUpdateTime = Date.now();
+}
+
 // Загрузка всех пикселей из Supabase при старте
 async function loadCanvasFromSupabase() {
+    console.time('Load from Supabase');
+    
     try {
-        let allPixels = [];
-        let page = 0;
-        const pageSize = 1000;
-        let hasMore = true;
+        // Загружаем все пиксели одним запросом с увеличенным лимитом
+        const { data: pixels, error, count } = await supabase
+            .from('pixels')
+            .select('*', { count: 'exact' })
+            .limit(100000); // Максимальный лимит Supabase
         
-        // Загружаем все пиксели постранично
-        while (hasMore) {
-            const { data: pixels, error } = await supabase
-                .from('pixels')
-                .select('*')
-                .range(page * pageSize, (page + 1) * pageSize - 1);
-            
-            if (error) {
-                console.error('Error loading canvas:', error);
-                return;
-            }
-            
-            if (pixels && pixels.length > 0) {
-                allPixels = allPixels.concat(pixels);
-                page++;
-            } else {
-                hasMore = false;
-            }
+        if (error) {
+            console.error('Error loading canvas:', error);
+            return;
         }
         
-        // Применяем загруженные пиксели
-        for (const pixel of allPixels) {
-            const { x, y, color } = pixel;
-            const r = parseInt(color.slice(1, 3), 16);
-            const g = parseInt(color.slice(3, 5), 16);
-            const b = parseInt(color.slice(5, 7), 16);
-            const colorValue = 0xFF000000 | (b << 16) | (g << 8) | r;
+        if (pixels && pixels.length > 0) {
+            // Применяем загруженные пиксели
+            for (const pixel of pixels) {
+                const { x, y, color } = pixel;
+                const r = parseInt(color.slice(1, 3), 16);
+                const g = parseInt(color.slice(3, 5), 16);
+                const b = parseInt(color.slice(5, 7), 16);
+                const colorValue = 0xFF000000 | (b << 16) | (g << 8) | r;
+                
+                const index = y * CANVAS_SIZE + x;
+                canvasData[index] = colorValue;
+            }
             
-            const index = y * CANVAS_SIZE + x;
-            canvasData[index] = colorValue;
+            pixelsCount = pixels.length;
         }
         
-        console.log(`Loaded ${allPixels.length} pixels from Supabase`);
+        console.timeEnd('Load from Supabase');
+        console.log(`Loaded ${pixelsCount} pixels from Supabase`);
+        
+        // Обновляем кэш после загрузки
+        updateCache();
+        
     } catch (e) {
         console.error('Failed to load canvas:', e);
     }
@@ -72,6 +118,7 @@ async function savePixelToSupabase(x, y, color) {
             return false;
         }
         
+        pixelsCount++;
         return true;
     } catch (e) {
         console.error('Failed to save pixel:', e);
@@ -79,15 +126,21 @@ async function savePixelToSupabase(x, y, color) {
     }
 }
 
-const wss = new WebSocket.Server({ port: PORT });
+const wss = new WebSocket.Server({ 
+    port: PORT,
+    // Увеличиваем лимиты для больших сообщений
+    maxPayload: 50 * 1024 * 1024 // 50 MB
+});
+
 console.log(`WebSocket server running on port ${PORT}`);
 
 let onlineCount = 0;
 
 function broadcast(message, excludeWs = null) {
+    const messageStr = JSON.stringify(message);
     wss.clients.forEach(client => {
         if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(message));
+            client.send(messageStr);
         }
     });
 }
@@ -101,12 +154,25 @@ wss.on('connection', (ws) => {
     console.log(`Client connected. Online: ${onlineCount}`);
     broadcastOnlineCount();
     
-    // Отправляем начальное состояние
-    ws.send(JSON.stringify({
-        type: 'init',
-        canvas: Array.from(canvasData),
-        onlineCount: onlineCount
-    }));
+    // Отправляем начальное состояние (используем кэш)
+    if (cachedCanvasArray) {
+        // Отправляем сжатые данные
+        ws.send(JSON.stringify({
+            type: 'init',
+            canvas: cachedCanvasArray,
+            compressed: true,
+            onlineCount: onlineCount
+        }));
+        console.log(`Sent cached canvas (${cachedCanvasArray.length} bytes)`);
+    } else {
+        // Если кэша нет, отправляем обычный массив
+        ws.send(JSON.stringify({
+            type: 'init',
+            canvas: Array.from(canvasData),
+            compressed: false,
+            onlineCount: onlineCount
+        }));
+    }
     
     ws.on('message', async (data) => {
         try {
@@ -130,21 +196,37 @@ wss.on('connection', (ws) => {
                     return;
                 }
                 
-                // Сохраняем в Supabase
-                const saved = await savePixelToSupabase(x, y, color);
+                // Сохраняем в Supabase (асинхронно, не блокируем)
+                savePixelToSupabase(x, y, color).then(saved => {
+                    if (saved) {
+                        canvasData[index] = colorValue;
+                        
+                        // Обновляем кэш только раз в секунду
+                        const now = Date.now();
+                        if (now - lastUpdateTime > 1000) {
+                            updateCache();
+                        }
+                        
+                        broadcast({
+                            type: 'pixelUpdate',
+                            x: x,
+                            y: y,
+                            color: color
+                        }, ws);
+                    }
+                });
                 
-                if (saved) {
-                    canvasData[index] = colorValue;
-                    
-                    broadcast({
-                        type: 'pixelUpdate',
-                        x: x,
-                        y: y,
-                        color: color
-                    }, ws);
-                    
-                    console.log(`Pixel placed at (${x}, ${y}) with color ${color}`);
-                }
+                // Сразу обновляем локально и отправляем другим
+                canvasData[index] = colorValue;
+                
+                broadcast({
+                    type: 'pixelUpdate',
+                    x: x,
+                    y: y,
+                    color: color
+                }, ws);
+                
+                console.log(`Pixel placed at (${x}, ${y}) with color ${color}`);
             }
         } catch (e) {
             console.error('Failed to parse message:', e);
@@ -191,6 +273,11 @@ async function subscribeToChanges() {
     
     console.log('Subscribed to Supabase realtime changes');
 }
+
+// Периодическое обновление кэша
+setInterval(() => {
+    updateCache();
+}, 5000);
 
 // Запуск
 async function start() {
